@@ -9,7 +9,7 @@ on:
 env:
   DOCKER_PLATFORMS: |
     linux/amd64
-    linux/arm64
+    # linux/arm64
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.repository }}

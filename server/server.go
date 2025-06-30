@@ -47,17 +47,22 @@ type Server struct {
 	echoServer        *echo.Echo
 	grpcServer        *grpc.Server
 	profiler          *profiler.Profiler
+	tracerProvider    *trace.TracerProvider
 	runnerCancelFuncs []context.CancelFunc
 }
 
-func InitOtel() error {
+func InitOtel() (*trace.TracerProvider, error) {
+	// Check if OpenTelemetry is enabled
+	if os.Getenv("OTEL_SDK_DISABLED") == "true" {
+		slog.Info("OpenTelemetry is disabled")
+		return nil, nil
+	}
+
 	// Read configuration from environment variables
 	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 	if endpoint == "" {
 		endpoint = "http://localhost:4318" // Default OTLP HTTP endpoint
 	}
-
-	slog.Info("OTEL_EXPORTER_OTLP_ENDPOINT", "endpoint", endpoint)
 
 	serviceName := os.Getenv("OTEL_SERVICE_NAME")
 	if serviceName == "" {
@@ -69,6 +74,14 @@ func InitOtel() error {
 		serviceVersion = "unknown"
 	}
 
+	// Parse sampling ratio
+	samplingRatio := 1.0 // Default to 100% sampling
+	if ratioStr := os.Getenv("OTEL_TRACES_SAMPLER_ARG"); ratioStr != "" {
+		if ratio, err := parseFloat64(ratioStr); err == nil {
+			samplingRatio = ratio
+		}
+	}
+
 	// Create resource with service information
 	res, err := resource.Merge(
 		resource.Default(),
@@ -77,29 +90,48 @@ func InitOtel() error {
 			semconv.ServiceName(serviceName),
 			semconv.ServiceVersion(serviceVersion),
 			attribute.String("environment", os.Getenv("OTEL_ENVIRONMENT")),
+			// attribute.String("deployment.environment", os.Getenv("DEPLOYMENT_ENVIRONMENT")),
 		),
 	)
 	if err != nil {
-		return errors.Wrap(err, "failed to create otel resource")
+		return nil, errors.Wrap(err, "failed to create otel resource")
 	}
 
 	// Create OTLP HTTP exporter
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	exporter, err := otlptracehttp.New(ctx,
+	exporterOptions := []otlptracehttp.Option{
 		otlptracehttp.WithEndpoint(endpoint),
-		otlptracehttp.WithInsecure(), // Use insecure for local development
-	)
+	}
+
+	// Use insecure connection if explicitly set or if using localhost
+	if os.Getenv("OTEL_EXPORTER_OTLP_INSECURE") == "true" || strings.Contains(endpoint, "localhost") {
+		exporterOptions = append(exporterOptions, otlptracehttp.WithInsecure())
+	}
+
+	// Add headers if provided
+	if headers := os.Getenv("OTEL_EXPORTER_OTLP_HEADERS"); headers != "" {
+		headerMap := make(map[string]string)
+		for _, header := range strings.Split(headers, ",") {
+			parts := strings.SplitN(header, "=", 2)
+			if len(parts) == 2 {
+				headerMap[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+			}
+		}
+		exporterOptions = append(exporterOptions, otlptracehttp.WithHeaders(headerMap))
+	}
+
+	exporter, err := otlptracehttp.New(ctx, exporterOptions...)
 	if err != nil {
-		return errors.Wrap(err, "failed to create otlp exporter")
+		return nil, errors.Wrap(err, "failed to create otlp exporter")
 	}
 
 	// Create tracer provider
 	tp := trace.NewTracerProvider(
 		trace.WithBatcher(exporter),
 		trace.WithResource(res),
-		trace.WithSampler(trace.TraceIDRatioBased(1.0)), // Sample all traces
+		trace.WithSampler(trace.TraceIDRatioBased(samplingRatio)),
 	)
 
 	// Set global tracer provider
@@ -115,20 +147,32 @@ func InitOtel() error {
 		"endpoint", endpoint,
 		"service_name", serviceName,
 		"service_version", serviceVersion,
+		"sampling_ratio", samplingRatio,
 	)
 
-	return nil
+	return tp, nil
+}
+
+func parseFloat64(s string) (float64, error) {
+	if f, err := fmt.Sscanf(s, "%f", new(float64)); err == nil && f == 1 {
+		var result float64
+		fmt.Sscanf(s, "%f", &result)
+		return result, nil
+	}
+	return 0, fmt.Errorf("invalid float64: %s", s)
 }
 
 func NewServer(ctx context.Context, profile *profile.Profile, store *store.Store) (*Server, error) {
 	// Initialize OpenTelemetry
-	if err := InitOtel(); err != nil {
+	tracerProvider, err := InitOtel()
+	if err != nil {
 		slog.Warn("failed to initialize OpenTelemetry", "error", err)
 	}
 
 	s := &Server{
-		Store:   store,
-		Profile: profile,
+		Store:          store,
+		Profile:        profile,
+		tracerProvider: tracerProvider,
 	}
 
 	echoServer := echo.New()
@@ -266,6 +310,15 @@ func (s *Server) Shutdown(ctx context.Context) {
 
 	// Shutdown gRPC server.
 	s.grpcServer.GracefulStop()
+
+	// Shutdown OpenTelemetry tracer provider
+	if s.tracerProvider != nil {
+		if err := s.tracerProvider.Shutdown(ctx); err != nil {
+			slog.Error("failed to shutdown tracer provider", "error", err)
+		} else {
+			slog.Info("tracer provider shutdown successfully")
+		}
+	}
 
 	// Stop the profiler
 	if s.profiler != nil {
