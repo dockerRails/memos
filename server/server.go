@@ -83,20 +83,18 @@ func InitOtel() (*trace.TracerProvider, error) {
 	}
 
 	// Create resource with service information
-	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceName(serviceName),
-			semconv.ServiceVersion(serviceVersion),
-			attribute.String("environment", os.Getenv("OTEL_ENVIRONMENT")),
-			// attribute.String("deployment.environment", os.Getenv("DEPLOYMENT_ENVIRONMENT")),
-		),
+	hostname, _ := os.Hostname()
+	res := resource.NewWithAttributes(
+		semconv.SchemaURL,
+		semconv.ServiceName(serviceName),
+		semconv.ServiceVersion(serviceVersion),
+		semconv.HostName(hostname),
+		semconv.ProcessPID(os.Getpid()),
+		semconv.ProcessRuntimeName("go"),
+		semconv.ProcessRuntimeVersion(runtime.Version()),
+		attribute.String("environment", os.Getenv("OTEL_ENVIRONMENT")),
+		// attribute.String("deployment.environment", os.Getenv("DEPLOYMENT_ENVIRONMENT")),
 	)
-	if err != nil {
-		slog.Error("failed to create otel resource", "error", err)
-		return nil, errors.Wrap(err, "failed to create otel resource")
-	}
 
 	// Create OTLP HTTP exporter
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
