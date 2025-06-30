@@ -121,6 +121,11 @@ func InitOtel() error {
 }
 
 func NewServer(ctx context.Context, profile *profile.Profile, store *store.Store) (*Server, error) {
+	// Initialize OpenTelemetry
+	if err := InitOtel(); err != nil {
+		slog.Warn("failed to initialize OpenTelemetry", "error", err)
+	}
+
 	s := &Server{
 		Store:   store,
 		Profile: profile,
@@ -130,12 +135,6 @@ func NewServer(ctx context.Context, profile *profile.Profile, store *store.Store
 	echoServer.Debug = true
 	echoServer.HideBanner = true
 	echoServer.HidePort = true
-
-	// Set up OpenTelemetry
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
-		propagation.TraceContext{},
-		propagation.Baggage{},
-	))
 
 	echoServer.Use(middleware.Recover())
 
