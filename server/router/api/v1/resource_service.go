@@ -46,51 +46,151 @@ var SupportedThumbnailMimeTypes = []string{
 }
 
 func (s *APIV1Service) CreateResource(ctx context.Context, request *v1pb.CreateResourceRequest) (*v1pb.Resource, error) {
+	startTime := time.Now()
+	resourceUID := shortuuid.New()
+
+	slog.Info("CreateResource started",
+		slog.String("resource_uid", resourceUID),
+		slog.String("filename", request.Resource.Filename),
+		slog.String("type", request.Resource.Type),
+	)
+
 	user, err := s.GetCurrentUser(ctx)
 	if err != nil {
+		slog.Info("CreateResource failed to get current user",
+			slog.String("resource_uid", resourceUID),
+			slog.String("error", err.Error()),
+			slog.Duration("duration", time.Since(startTime)),
+		)
 		return nil, status.Errorf(codes.Internal, "failed to get current user: %v", err)
 	}
 
+	slog.Info("CreateResource got current user",
+		slog.String("resource_uid", resourceUID),
+		slog.Int("user_id", int(user.ID)),
+		slog.Duration("get_user_duration", time.Since(startTime)),
+	)
+
 	create := &store.Resource{
-		UID:       shortuuid.New(),
+		UID:       resourceUID,
 		CreatorID: user.ID,
 		Filename:  request.Resource.Filename,
 		Type:      request.Resource.Type,
 	}
 
+	storageSettingStart := time.Now()
 	workspaceStorageSetting, err := s.Store.GetWorkspaceStorageSetting(ctx)
 	if err != nil {
+		slog.Info("CreateResource failed to get workspace storage setting",
+			slog.String("resource_uid", resourceUID),
+			slog.String("error", err.Error()),
+			slog.Duration("duration", time.Since(startTime)),
+		)
 		return nil, status.Errorf(codes.Internal, "failed to get workspace storage setting: %v", err)
 	}
+
+	slog.Info("CreateResource got workspace storage setting",
+		slog.String("resource_uid", resourceUID),
+		slog.String("storage_type", workspaceStorageSetting.StorageType.String()),
+		slog.Duration("get_storage_setting_duration", time.Since(storageSettingStart)),
+	)
+
 	size := binary.Size(request.Resource.Content)
 	uploadSizeLimit := int(workspaceStorageSetting.UploadSizeLimitMb) * MebiByte
 	if uploadSizeLimit == 0 {
 		uploadSizeLimit = MaxUploadBufferSizeBytes
 	}
+
+	slog.Info("CreateResource file size validation",
+		slog.String("resource_uid", resourceUID),
+		slog.Int("file_size", size),
+		slog.Int("upload_limit", uploadSizeLimit),
+		slog.Float64("size_mb", float64(size)/float64(MebiByte)),
+	)
+
 	if size > uploadSizeLimit {
+		slog.Info("CreateResource file size exceeds limit",
+			slog.String("resource_uid", resourceUID),
+			slog.Int("file_size", size),
+			slog.Int("upload_limit", uploadSizeLimit),
+			slog.Duration("duration", time.Since(startTime)),
+		)
 		return nil, status.Errorf(codes.InvalidArgument, "file size exceeds the limit")
 	}
+
 	create.Size = int64(size)
 	create.Blob = request.Resource.Content
+
+	saveBlobStart := time.Now()
 	if err := SaveResourceBlob(ctx, s.Profile, s.Store, create); err != nil {
+		slog.Info("CreateResource failed to save resource blob",
+			slog.String("resource_uid", resourceUID),
+			slog.String("error", err.Error()),
+			slog.Duration("duration", time.Since(startTime)),
+		)
 		return nil, status.Errorf(codes.Internal, "failed to save resource blob: %v", err)
 	}
 
+	slog.Info("CreateResource saved resource blob",
+		slog.String("resource_uid", resourceUID),
+		slog.String("storage_type", create.StorageType.String()),
+		slog.Duration("save_blob_duration", time.Since(saveBlobStart)),
+	)
+
 	if request.Resource.Memo != nil {
+		memoProcessStart := time.Now()
 		memoUID, err := ExtractMemoUIDFromName(*request.Resource.Memo)
 		if err != nil {
+			slog.Info("CreateResource invalid memo name",
+				slog.String("resource_uid", resourceUID),
+				slog.String("memo_name", *request.Resource.Memo),
+				slog.String("error", err.Error()),
+				slog.Duration("duration", time.Since(startTime)),
+			)
 			return nil, status.Errorf(codes.InvalidArgument, "invalid memo name: %v", err)
 		}
 		memo, err := s.Store.GetMemo(ctx, &store.FindMemo{UID: &memoUID})
 		if err != nil {
+			slog.Info("CreateResource failed to find memo",
+				slog.String("resource_uid", resourceUID),
+				slog.String("memo_uid", memoUID),
+				slog.String("error", err.Error()),
+				slog.Duration("duration", time.Since(startTime)),
+			)
 			return nil, status.Errorf(codes.Internal, "failed to find memo: %v", err)
 		}
 		create.MemoID = &memo.ID
+		slog.Info("CreateResource linked to memo",
+			slog.String("resource_uid", resourceUID),
+			slog.String("memo_uid", memoUID),
+			slog.Int("memo_id", int(memo.ID)),
+			slog.Duration("memo_process_duration", time.Since(memoProcessStart)),
+		)
 	}
+
+	createResourceStart := time.Now()
 	resource, err := s.Store.CreateResource(ctx, create)
 	if err != nil {
+		slog.Info("CreateResource failed to create resource in store",
+			slog.String("resource_uid", resourceUID),
+			slog.String("error", err.Error()),
+			slog.Duration("duration", time.Since(startTime)),
+		)
 		return nil, status.Errorf(codes.Internal, "failed to create resource: %v", err)
 	}
+
+	totalDuration := time.Since(startTime)
+	slog.Info("CreateResource completed successfully",
+		slog.String("resource_uid", resourceUID),
+		slog.Int("resource_id", int(resource.ID)),
+		slog.Int("creator_id", int(resource.CreatorID)),
+		slog.String("filename", resource.Filename),
+		slog.String("type", resource.Type),
+		slog.Int64("size", resource.Size),
+		slog.String("storage_type", resource.StorageType.String()),
+		slog.Duration("create_resource_duration", time.Since(createResourceStart)),
+		slog.Duration("total_duration", totalDuration),
+	)
 
 	return s.convertResourceFromStore(ctx, resource), nil
 }
