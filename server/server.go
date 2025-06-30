@@ -7,7 +7,9 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,6 +18,14 @@ import (
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/pkg/errors"
 	"github.com/soheilhy/cmux"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/labstack/echo/otelecho"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	"go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"google.golang.org/grpc"
 
 	"github.com/usememos/memos/internal/profile"
@@ -40,6 +50,76 @@ type Server struct {
 	runnerCancelFuncs []context.CancelFunc
 }
 
+func InitOtel() error {
+	// Read configuration from environment variables
+	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	if endpoint == "" {
+		endpoint = "http://localhost:4318" // Default OTLP HTTP endpoint
+	}
+
+	slog.Info("OTEL_EXPORTER_OTLP_ENDPOINT", "endpoint", endpoint)
+
+	serviceName := os.Getenv("OTEL_SERVICE_NAME")
+	if serviceName == "" {
+		serviceName = "memos-server"
+	}
+
+	serviceVersion := os.Getenv("OTEL_SERVICE_VERSION")
+	if serviceVersion == "" {
+		serviceVersion = "unknown"
+	}
+
+	// Create resource with service information
+	res, err := resource.Merge(
+		resource.Default(),
+		resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceName(serviceName),
+			semconv.ServiceVersion(serviceVersion),
+			attribute.String("environment", os.Getenv("OTEL_ENVIRONMENT")),
+		),
+	)
+	if err != nil {
+		return errors.Wrap(err, "failed to create otel resource")
+	}
+
+	// Create OTLP HTTP exporter
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	exporter, err := otlptracehttp.New(ctx,
+		otlptracehttp.WithEndpoint(endpoint),
+		otlptracehttp.WithInsecure(), // Use insecure for local development
+	)
+	if err != nil {
+		return errors.Wrap(err, "failed to create otlp exporter")
+	}
+
+	// Create tracer provider
+	tp := trace.NewTracerProvider(
+		trace.WithBatcher(exporter),
+		trace.WithResource(res),
+		trace.WithSampler(trace.TraceIDRatioBased(1.0)), // Sample all traces
+	)
+
+	// Set global tracer provider
+	otel.SetTracerProvider(tp)
+
+	// Set up propagators
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+
+	slog.Info("OpenTelemetry initialized",
+		"endpoint", endpoint,
+		"service_name", serviceName,
+		"service_version", serviceVersion,
+	)
+
+	return nil
+}
+
 func NewServer(ctx context.Context, profile *profile.Profile, store *store.Store) (*Server, error) {
 	s := &Server{
 		Store:   store,
@@ -50,7 +130,28 @@ func NewServer(ctx context.Context, profile *profile.Profile, store *store.Store
 	echoServer.Debug = true
 	echoServer.HideBanner = true
 	echoServer.HidePort = true
+
+	// Set up OpenTelemetry
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+
 	echoServer.Use(middleware.Recover())
+
+	// Add OpenTelemetry middleware
+	echoServer.Use(otelecho.Middleware("memos-server",
+		otelecho.WithTracerProvider(otel.GetTracerProvider()),
+		otelecho.WithSkipper(func(c echo.Context) bool {
+			// Skip tracing for health check and static assets
+			path := c.Request().URL.Path
+			return path == "/healthz" ||
+				path == "/favicon.ico" ||
+				strings.HasPrefix(path, "/assets/") ||
+				strings.HasPrefix(path, "/static/")
+		}),
+	))
+
 	// Add request logging middleware
 	echoServer.Use(middleware.LoggerWithConfig(middleware.LoggerConfig{
 		Format: "time=${time_rfc3339} method=${method} uri=${uri} status=${status} " +
