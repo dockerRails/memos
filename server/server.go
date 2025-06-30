@@ -51,6 +51,80 @@ type Server struct {
 	runnerCancelFuncs []context.CancelFunc
 }
 
+// CustomLoggerMiddleware creates a custom middleware that logs before and after request processing
+func CustomLoggerMiddleware() echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			req := c.Request()
+			res := c.Response()
+			path := req.URL.Path
+
+			// Skip logging for certain paths to reduce noise
+			skipPaths := []string{"/healthz", "/favicon.ico"}
+			for _, skipPath := range skipPaths {
+				if path == skipPath {
+					return next(c)
+				}
+			}
+			// Skip static assets
+			if strings.HasPrefix(path, "/assets/") || strings.HasPrefix(path, "/static/") {
+				return next(c)
+			}
+
+			start := time.Now()
+
+			// Log before processing
+			slog.Info("request started",
+				"method", req.Method,
+				"uri", req.RequestURI,
+				"path", path,
+				"remote_ip", c.RealIP(),
+				"user_agent", req.UserAgent(),
+				"host", req.Host,
+				"content_length", req.ContentLength,
+				"request_id", c.Response().Header().Get(echo.HeaderXRequestID),
+			)
+
+			// Process request
+			err := next(c)
+
+			// Log after processing
+			stop := time.Now()
+			latency := stop.Sub(start)
+
+			logLevel := slog.LevelInfo
+			if res.Status >= 500 {
+				logLevel = slog.LevelError
+			} else if res.Status >= 400 {
+				logLevel = slog.LevelWarn
+			}
+
+			slog.Log(context.Background(), logLevel, "request completed",
+				"method", req.Method,
+				"uri", req.RequestURI,
+				"path", path,
+				"status", res.Status,
+				"latency", latency.String(),
+				"latency_ms", latency.Milliseconds(),
+				"latency_ns", latency.Nanoseconds(),
+				"bytes_out", res.Size,
+				"remote_ip", c.RealIP(),
+				"user_agent", req.UserAgent(),
+				"host", req.Host,
+				"request_id", c.Response().Header().Get(echo.HeaderXRequestID),
+				"error", func() interface{} {
+					if err != nil {
+						return err.Error()
+					}
+					return nil
+				}(),
+			)
+
+			return err
+		}
+	}
+}
+
 func InitOtel() (*trace.TracerProvider, error) {
 	// Check if OpenTelemetry is enabled
 	if os.Getenv("OTEL_SDK_DISABLED") == "true" {
@@ -182,6 +256,9 @@ func NewServer(ctx context.Context, profile *profile.Profile, store *store.Store
 
 	echoServer.Use(middleware.Recover())
 
+	// Add request ID middleware
+	echoServer.Use(middleware.RequestID())
+
 	// Add OpenTelemetry middleware
 	echoServer.Use(otelecho.Middleware("memos-server",
 		otelecho.WithTracerProvider(otel.GetTracerProvider()),
@@ -197,11 +274,16 @@ func NewServer(ctx context.Context, profile *profile.Profile, store *store.Store
 
 	// Add request logging middleware
 	echoServer.Use(middleware.LoggerWithConfig(middleware.LoggerConfig{
-		Format: "time=${time_rfc3339} method=${method} uri=${uri} status=${status} " +
-			"latency=${latency_human} bytes_in=${bytes_in} bytes_out=${bytes_out} " +
-			"remote_ip=${remote_ip} user_agent=${user_agent}\n",
-		CustomTimeFormat: "2006-01-02 15:04:05",
+		Format: `{"time":"${time_rfc3339_nano}","id":"${id}","remote_ip":"${remote_ip}",` +
+			`"host":"${host}","method":"${method}","uri":"${uri}","user_agent":"${user_agent}",` +
+			`"status":${status},"error":"${error}","latency":${latency},"latency_human":"${latency_human}"` +
+			`,"bytes_in":${bytes_in},"bytes_out":${bytes_out}}` + "\n",
+		CustomTimeFormat: "2006-01-02 15:04:05.00000",
 	}))
+
+	// Add custom logger middleware for before/after logging
+	echoServer.Use(CustomLoggerMiddleware())
+
 	s.echoServer = echoServer
 
 	// Initialize profiler
