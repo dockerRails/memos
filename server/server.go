@@ -94,6 +94,7 @@ func InitOtel() (*trace.TracerProvider, error) {
 		),
 	)
 	if err != nil {
+		slog.Error("failed to create otel resource", "error", err)
 		return nil, errors.Wrap(err, "failed to create otel resource")
 	}
 
@@ -124,6 +125,7 @@ func InitOtel() (*trace.TracerProvider, error) {
 
 	exporter, err := otlptracehttp.New(ctx, exporterOptions...)
 	if err != nil {
+		slog.Error("failed to create otlp exporter", "error", err)
 		return nil, errors.Wrap(err, "failed to create otlp exporter")
 	}
 
