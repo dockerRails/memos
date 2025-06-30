@@ -51,6 +51,13 @@ func NewServer(ctx context.Context, profile *profile.Profile, store *store.Store
 	echoServer.HideBanner = true
 	echoServer.HidePort = true
 	echoServer.Use(middleware.Recover())
+	// Add request logging middleware
+	echoServer.Use(middleware.LoggerWithConfig(middleware.LoggerConfig{
+		Format: "time=${time_rfc3339} method=${method} uri=${uri} status=${status} " +
+			"latency=${latency_human} bytes_in=${bytes_in} bytes_out=${bytes_out} " +
+			"remote_ip=${remote_ip} user_agent=${user_agent}\n",
+		CustomTimeFormat: "2006-01-02 15:04:05",
+	}))
 	s.echoServer = echoServer
 
 	// Initialize profiler
